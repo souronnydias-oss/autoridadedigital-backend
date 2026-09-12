@@ -85,6 +85,7 @@ seedDev({ user_id: brokerId, title: 'Residencial Vista Verde', subtitle: 'Lança
 seedDev({ user_id: brokerId, title: 'Alto da Serra Residences', subtitle: 'Alto padrão com varanda gourmet', description: 'Empreendimento de alto padrão na Serra. Apartamentos de 3 e 4 suítes com 80 a 130m². Segurança 24h e área verde exclusiva.', price: 'R$ 1.250.000', location: 'Serra - Espirito Santo/ES', status: 'em construção', type: 'apartamento', media: [], featured: 1, published: 1 })
 
 const app = express()
+app.set('trust proxy', 1)
 app.use(cors())
 app.use(express.json({ limit: '2mb' }))
 app.use('/uploads', express.static(UPLOAD_DIR))
@@ -161,7 +162,7 @@ app.get('/api/developments/:id', (req, res) => {
 // ---- Upload (auth) ----
 app.post('/api/upload', auth(), upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Arquivo não enviado' })
-  const url = `/uploads/${req.file.filename}`
+  const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`
   const ext = path.extname(req.file.filename).toLowerCase()
   const type = ['.mp4', '.webm', '.mov'].includes(ext) ? 'video' : 'image'
   res.json({ url, type })
