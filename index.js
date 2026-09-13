@@ -3,10 +3,13 @@ import cors from 'cors'
 import path from 'node:path'
 import fs from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
+import { supabase, useSupabase } from './supabase.js'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import multer from 'multer'
 import { fileURLToPath } from 'node:url'
+import { generatePosts, PLATFORMS } from './templates.js'
+import { publish } from './publisher.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data.db')
@@ -58,6 +61,18 @@ db.exec(`
     status TEXT NOT NULL DEFAULT 'novo',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+  CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    development_id INTEGER REFERENCES developments(id),
+    platform TEXT NOT NULL,
+    content TEXT NOT NULL,
+    media TEXT NOT NULL DEFAULT '[]',
+    scheduled_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'agendado',
+    published_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `)
 
 const seedUser = (name, email, role, extra = {}) => {
@@ -72,6 +87,9 @@ seedUser('Administrador', 'admin@autoridadedigital.com', 'admin', {})
 const brokerId = seedUser('Carlos Almeida', 'corretor@autoridadedigital.com', 'broker', {
   whatsapp: '5511999999999',
   instagram: '@carlosalmeida.imoveis',
+  tiktok: '@carlosalmeida',
+  linkedin: 'in/carlosalmeida',
+  facebook: 'carlosalmeida.imoveis',
   about: 'Corretor de imóveis com mais de 10 anos de experiência. Especialista em lançamentos e alto padrão na região.'
 })
 
@@ -236,5 +254,81 @@ app.use((err, req, res, next) => {
   console.error(err)
   res.status(500).json({ error: err.message || 'Erro interno' })
 })
+
+// ---- Posts agendados (geração automática) ----
+const getOwned = (table, id, user) => {
+  const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id)
+  if (!row) return null
+  if (user.role !== 'admin' && row.user_id !== user.id) return null
+  return row
+}
+
+app.get('/api/posts', auth(), (req, res) => {
+  const rows = db.prepare(`SELECT p.*, d.title AS development_title
+    FROM posts p LEFT JOIN developments d ON d.id = p.development_id
+    ${req.user.role === 'admin' ? '' : 'WHERE p.user_id = ?'}
+    ORDER BY p.scheduled_at DESC`).all(...(req.user.role === 'admin' ? [] : [req.user.id]))
+    .map(p => ({ ...p, media: parseMedia(p.media) }))
+  res.json({ posts: rows })
+})
+
+app.post('/api/posts', auth(), (req, res) => {
+  const { development_id, platform, scheduled_at } = req.body
+  if (!scheduled_at) return res.status(400).json({ error: 'Defina a data/hora do agendamento' })
+  const due = new Date(scheduled_at)
+  if (isNaN(due)) return res.status(400).json({ error: 'Data inválida' })
+
+  let dev = null
+  if (development_id) {
+    dev = getOwned('developments', development_id, req.user)
+    if (!dev) return res.status(403).json({ error: 'Empreendimento não encontrado' })
+    dev.media = parseMedia(dev.media)
+  }
+  const generated = generatePosts(dev, req.user)
+  const targets = platform === 'all' ? PLATFORMS : [platform]
+  if (!targets.every(p => PLATFORMS.includes(p))) return res.status(400).json({ error: 'Plataforma inválida' })
+
+  const iso = due.toISOString()
+  const ids = targets.map(p => {
+    const g = generated[p]
+    const r = db.prepare(`INSERT INTO posts (user_id, development_id, platform, content, media, scheduled_at)
+      VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(req.user.id, development_id || null, p, g.content, JSON.stringify(g.media), iso)
+    return r.lastInsertRowid
+  })
+  res.json({ ok: true, ids, next_publish: iso })
+})
+
+app.delete('/api/posts/:id', auth(), (req, res) => {
+  const post = getOwned('posts', req.params.id, req.user)
+  if (!post) return res.status(403).json({ error: 'Post não encontrado' })
+  db.prepare('DELETE FROM posts WHERE id = ?').run(post.id)
+  res.json({ ok: true })
+})
+
+app.patch('/api/posts/:id', auth(), (req, res) => {
+  const post = getOwned('posts', req.params.id, req.user)
+  if (!post) return res.status(403).json({ error: 'Post não encontrado' })
+  const { scheduled_at } = req.body
+  if (scheduled_at) {
+    const due = new Date(scheduled_at)
+    if (isNaN(due)) return res.status(400).json({ error: 'Data inválida' })
+    db.prepare('UPDATE posts SET scheduled_at = ? WHERE id = ?').run(due.toISOString(), post.id)
+  }
+  res.json({ ok: true })
+})
+
+// Processador: publica posts vencidos (a cada 60s)
+const checkDuePosts = () => {
+  const now = new Date().toISOString()
+  const due = db.prepare("SELECT * FROM posts WHERE status = 'agendado' AND scheduled_at <= ?").all(now)
+  for (const post of due) {
+    publish(post).then(() => {
+      db.prepare("UPDATE posts SET status = 'publicado', published_at = ? WHERE id = ?")
+        .run(new Date().toISOString(), post.id)
+    }).catch(e => console.error('[publish error]', e))
+  }
+}
+setInterval(checkDuePosts, 60_000)
 
 app.listen(PORT, () => console.log(`API em http://localhost:${PORT}`))
