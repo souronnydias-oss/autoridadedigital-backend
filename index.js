@@ -1,106 +1,27 @@
 import express from 'express'
+import './env.js'
 import cors from 'cors'
 import path from 'node:path'
 import fs from 'node:fs'
-import { DatabaseSync } from 'node:sqlite'
-import { supabase, useSupabase } from './supabase.js'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import multer from 'multer'
 import { fileURLToPath } from 'node:url'
+import { supabase } from './supabase.js'
 import { generatePosts, PLATFORMS } from './templates.js'
 import { publish } from './publisher.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data.db')
 const UPLOAD_DIR = path.join(__dirname, 'uploads')
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-troque-em-producao'
 const PORT = process.env.PORT || 3001
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true })
 
-const db = new DatabaseSync(DB_PATH)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'broker',
-    whatsapp TEXT,
-    instagram TEXT,
-    about TEXT,
-    photo TEXT,
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS developments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    title TEXT NOT NULL,
-    subtitle TEXT,
-    description TEXT,
-    price TEXT,
-    location TEXT,
-    status TEXT NOT NULL DEFAULT 'disponivel',
-    type TEXT NOT NULL DEFAULT 'apartamento',
-    media TEXT NOT NULL DEFAULT '[]',
-    featured INTEGER NOT NULL DEFAULT 0,
-    published INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS leads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    broker_id INTEGER NOT NULL REFERENCES users(id),
-    development_id INTEGER REFERENCES developments(id),
-    name TEXT NOT NULL,
-    phone TEXT,
-    whatsapp TEXT,
-    email TEXT,
-    message TEXT,
-    status TEXT NOT NULL DEFAULT 'novo',
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    development_id INTEGER REFERENCES developments(id),
-    platform TEXT NOT NULL,
-    content TEXT NOT NULL,
-    media TEXT NOT NULL DEFAULT '[]',
-    scheduled_at TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'agendado',
-    published_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-`)
-
-const seedUser = (name, email, role, extra = {}) => {
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email)
-  if (existing) return existing.id
-  const hash = bcrypt.hashSync('admin123', 10)
-  const r = db.prepare(`INSERT INTO users (name, email, password_hash, role, whatsapp, instagram, about)
-    VALUES (?, ?, ?, ?, ?, ?, ?)`).run(name, email, hash, role, extra.whatsapp || null, extra.instagram || null, extra.about || null)
-  return r.lastInsertRowid
+if (!supabase) {
+  console.error('[startup] Supabase NÃO configurado — defina SUPABASE_URL e SUPABASE_KEY no ambiente/.env')
+  process.exit(1)
 }
-seedUser('Administrador', 'admin@autoridadedigital.com', 'admin', {})
-const brokerId = seedUser('Carlos Almeida', 'corretor@autoridadedigital.com', 'broker', {
-  whatsapp: '5511999999999',
-  instagram: '@carlosalmeida.imoveis',
-  tiktok: '@carlosalmeida',
-  linkedin: 'in/carlosalmeida',
-  facebook: 'carlosalmeida.imoveis',
-  about: 'Corretor de imóveis com mais de 10 anos de experiência. Especialista em lançamentos e alto padrão na região.'
-})
-
-const seedDev = (dev) => {
-  const existing = db.prepare('SELECT id FROM developments WHERE title = ?').get(dev.title)
-  if (existing) return
-  db.prepare(`INSERT INTO developments (user_id, title, subtitle, description, price, location, status, type, media, featured, published)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(dev.user_id, dev.title, dev.subtitle, dev.description, dev.price, dev.location, dev.status, dev.type, JSON.stringify(dev.media), dev.featured, dev.published)
-}
-seedDev({ user_id: brokerId, title: 'Residencial Vista Verde', subtitle: 'Lançamento 2 e 3 dormitórios', description: 'A 5 minutos do bairro das avenidas. Lazer completo: piscina, academia e espaço gourmet. Torre única com 20 andares e vista privilegiada.', price: 'R$ 489.900', location: 'Zona Sul - São Paulo/SP', status: 'lançamento', type: 'apartamento', media: [], featured: 1, published: 1 })
-seedDev({ user_id: brokerId, title: 'Alto da Serra Residences', subtitle: 'Alto padrão com varanda gourmet', description: 'Empreendimento de alto padrão na Serra. Apartamentos de 3 e 4 suítes com 80 a 130m². Segurança 24h e área verde exclusiva.', price: 'R$ 1.250.000', location: 'Serra - Espirito Santo/ES', status: 'em construção', type: 'apartamento', media: [], featured: 1, published: 1 })
 
 const app = express()
 app.set('trust proxy', 1)
@@ -110,19 +31,16 @@ app.use('/uploads', express.static(UPLOAD_DIR))
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase()
-    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e6)}${ext}`)
-  }
+  filename: (req, file, cb) => cb(null, `${Date.now()}-${Math.round(Math.random() * 1e6)}${path.extname(file.originalname).toLowerCase()}`)
 })
 const upload = multer({ storage, limits: { fileSize: 200 * 1024 * 1024 } })
 
-const auth = (roles) => (req, res, next) => {
+const auth = (roles) => async (req, res, next) => {
   const token = (req.headers.authorization || '').replace('Bearer ', '')
   if (!token) return res.status(401).json({ error: 'Não autenticado' })
   let payload
   try { payload = jwt.verify(token, JWT_SECRET) } catch { return res.status(401).json({ error: 'Sessão expirada' }) }
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.id)
+  const { data: user } = await supabase.from('users').select('*').eq('id', payload.id).maybeSingle()
   if (!user) return res.status(401).json({ error: 'Usuário não encontrado' })
   if (roles && !roles.includes(user.role)) return res.status(403).json({ error: 'Sem permissão' })
   req.user = user
@@ -130,18 +48,23 @@ const auth = (roles) => (req, res, next) => {
 }
 
 const publicUser = (u) => u && ({ id: u.id, name: u.name, whatsapp: u.whatsapp, about: u.about, photo: u.photo, instagram: u.instagram })
-const parseMedia = (m) => { try { return typeof m === 'string' ? JSON.parse(m) : [] } catch { return [] } }
+const mediaArr = (m) => Array.isArray(m) ? m : []
+const publicBroker = () =>
+  supabase.from('users').select('*').eq('role', 'broker').eq('active', true).order('id', { ascending: true }).limit(1).maybeSingle()
 
-const publicBroker = () => {
-  const b = db.prepare("SELECT * FROM users WHERE role = 'broker' AND active = 1 ORDER BY id LIMIT 1").get()
-  return b
+const findOwned = async (table, id, user) => {
+  let q = supabase.from(table).select('*').eq('id', id)
+  if (user.role !== 'admin' && table !== 'leads') q = q.eq('user_id', user.id)
+  if (table === 'leads' && user.role !== 'admin') q = q.eq('broker_id', user.id)
+  const { data } = await q.maybeSingle()
+  return data
 }
 
 // ---- Auth ----
-app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(email || '').toLowerCase())
-  if (!user || !bcrypt.compareSync(String(password || ''), user.password_hash))
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body?.email || '').toLowerCase()
+  const { data: user } = await supabase.from('users').select('*').eq('email', email).maybeSingle()
+  if (!user || !bcrypt.compareSync(String(req.body?.password || ''), user.password_hash))
     return res.status(401).json({ error: 'E-mail ou senha inválidos' })
   const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '7d' })
   res.json({ token, user: publicUser(user) })
@@ -150,185 +73,215 @@ app.post('/api/auth/login', (req, res) => {
 app.get('/api/auth/me', auth(), (req, res) => res.json({ user: publicUser(req.user) }))
 
 // ---- Público (landing) ----
-app.get('/api/public', (req, res) => {
-  const broker = publicBroker()
+app.get('/api/public', async (req, res) => {
+  const { data: broker } = await publicBroker()
   if (!broker) return res.json({ broker: null, developments: [] })
-  const devs = db.prepare('SELECT * FROM developments WHERE published = 1 ORDER BY featured DESC, id DESC').all()
-    .map(d => ({ ...d, media: parseMedia(d.media) }))
-  res.json({ broker: publicUser(broker), developments: devs })
+  const { data: devs } = await supabase.from('developments')
+    .select('*').eq('published', true).order('featured', { ascending: false }).order('id', { ascending: false })
+  res.json({ broker: publicUser(broker), developments: (devs || []).map(d => ({ ...d, media: mediaArr(d.media) })) })
 })
 
-app.post('/api/leads', (req, res) => {
-  const { name, phone, whatsapp, email, message, development_id } = req.body
+app.post('/api/leads', async (req, res) => {
+  const { name, phone, whatsapp, email, message, development_id } = req.body || {}
   if (!name || !phone) return res.status(400).json({ error: 'Nome e telefone são obrigatórios' })
-  const broker = publicBroker()
+  const { data: broker } = await publicBroker()
   if (!broker) return res.status(500).json({ error: 'Sem corretor configurado' })
-  const r = db.prepare(`INSERT INTO leads (broker_id, development_id, name, phone, whatsapp, email, message)
-    VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(broker.id, development_id || null, String(name).trim(), String(phone).trim(), whatsapp || null, email || null, message || null)
-  db.prepare('UPDATE developments SET status = status WHERE id != ?').all(r.lastInsertRowid) // placeholder no-op
-  res.json({ ok: true, id: r.lastInsertRowid })
+  const { data, error } = await supabase.from('leads').insert({
+    broker_id: broker.id,
+    development_id: development_id || null,
+    name: String(name).trim(),
+    phone: String(phone).trim(),
+    whatsapp: whatsapp || null,
+    email: email || null,
+    message: message || null
+  }).select('id').single()
+  if (error) return res.status(400).json({ error: error.message })
+  res.json({ ok: true, id: data.id })
 })
 
 // ---- Público: detalhe ----
-app.get('/api/developments/:id', (req, res) => {
-  const d = db.prepare('SELECT * FROM developments WHERE id = ? AND published = 1').get(req.params.id)
+app.get('/api/developments/:id', async (req, res) => {
+  const { data: d } = await supabase.from('developments').select('*').eq('id', req.params.id).eq('published', true).maybeSingle()
   if (!d) return res.status(404).json({ error: 'Não encontrado' })
-  res.json({ ...d, media: parseMedia(d.media) })
+  res.json({ ...d, media: mediaArr(d.media) })
 })
 
 // ---- Upload (auth) ----
 app.post('/api/upload', auth(), upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Arquivo não enviado' })
-  const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`
   const ext = path.extname(req.file.filename).toLowerCase()
-  const type = ['.mp4', '.webm', '.mov'].includes(ext) ? 'video' : 'image'
-  res.json({ url, type })
+  res.json({ url: `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`, type: ['.mp4', '.webm', '.mov'].includes(ext) ? 'video' : 'image' })
 })
 
 // ---- Admin/Corretor: developments ----
-app.get('/api/admin/developments', auth(), (req, res) => {
-  const rows = db.prepare('SELECT * FROM developments ORDER BY id DESC')
-    .all().map(d => ({ ...d, media: parseMedia(d.media) }))
-    .filter(d => req.user.role === 'admin' || d.user_id === req.user.id)
-  res.json({ developments: rows })
+app.get('/api/admin/developments', auth(), async (req, res) => {
+  let q = supabase.from('developments').select('*').order('id', { ascending: false })
+  if (req.user.role !== 'admin') q = q.eq('user_id', req.user.id)
+  const { data } = await q
+  res.json({ developments: (data || []).map(d => ({ ...d, media: mediaArr(d.media) })) })
 })
 
-app.post('/api/admin/developments', auth(), (req, res) => {
-  const { title, subtitle, description, price, location, status, type, media, featured, published } = req.body
+app.post('/api/admin/developments', auth(), async (req, res) => {
+  const { title, subtitle, description, price, location, status, type, media, featured, published } = req.body || {}
   if (!title) return res.status(400).json({ error: 'Título é obrigatório' })
-  const r = db.prepare(`INSERT INTO developments (user_id, title, subtitle, description, price, location, status, type, media, featured, published)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(req.user.id, String(title), subtitle || null, description || null, price || null, location || null,
-      status || 'disponivel', type || 'apartamento', JSON.stringify(media || []), featured ? 1 : 0, published === undefined ? 1 : (published ? 1 : 0))
-  res.json({ ok: true, id: r.lastInsertRowid })
+  const { data, error } = await supabase.from('developments').insert({
+    user_id: req.user.id,
+    title: String(title),
+    subtitle: subtitle || null,
+    description: description || null,
+    price: price || null,
+    location: location || null,
+    status: status || 'disponivel',
+    type: type || 'apartamento',
+    media: media || [],
+    featured: !!featured,
+    published: published === undefined ? true : !!published
+  }).select('id').single()
+  if (error) return res.status(400).json({ error: error.message })
+  res.json({ ok: true, id: data.id })
 })
 
-app.put('/api/admin/developments/:id', auth(), (req, res) => {
-  const dev = db.prepare('SELECT * FROM developments WHERE id = ?').get(req.params.id)
-  if (!dev) return res.status(404).json({ error: 'Não encontrado' })
-  if (req.user.role !== 'admin' && dev.user_id !== req.user.id) return res.status(403).json({ error: 'Sem permissão' })
-  const { title, subtitle, description, price, location, status, type, media, featured, published } = req.body
-  db.prepare(`UPDATE developments SET title=?, subtitle=?, description=?, price=?, location=?, status=?, type=?, media=?, featured=?, published=? WHERE id=?`)
-    .run(String(title || dev.title), subtitle ?? dev.subtitle, description ?? dev.description, price ?? dev.price,
-      location ?? dev.location, status || dev.status, type || dev.type, JSON.stringify(media || parseMedia(dev.media)),
-      featured ? 1 : 0, published === undefined ? dev.published : (published ? 1 : 0), dev.id)
+app.put('/api/admin/developments/:id', auth(), async (req, res) => {
+  const dev = await findOwned('developments', req.params.id, req.user)
+  if (!dev) return res.status(403).json({ error: 'Sem permissão' })
+  const { title, subtitle, description, price, location, status, type, media, featured, published } = req.body || {}
+  const { error } = await supabase.from('developments').update({
+    title: String(title || dev.title),
+    subtitle: subtitle ?? dev.subtitle,
+    description: description ?? dev.description,
+    price: price ?? dev.price,
+    location: location ?? dev.location,
+    status: status || dev.status,
+    type: type || dev.type,
+    media: Array.isArray(media) ? media : dev.media,
+    featured: featured !== undefined ? !!featured : dev.featured,
+    published: published !== undefined ? !!published : dev.published
+  }).eq('id', dev.id)
+  if (error) return res.status(400).json({ error: error.message })
   res.json({ ok: true })
 })
 
-app.delete('/api/admin/developments/:id', auth(), (req, res) => {
-  const dev = db.prepare('SELECT * FROM developments WHERE id = ?').get(req.params.id)
-  if (!dev) return res.status(404).json({ error: 'Não encontrado' })
-  if (req.user.role !== 'admin' && dev.user_id !== req.user.id) return res.status(403).json({ error: 'Sem permissão' })
-  db.prepare('DELETE FROM developments WHERE id = ?').run(dev.id)
+app.delete('/api/admin/developments/:id', auth(), async (req, res) => {
+  const dev = await findOwned('developments', req.params.id, req.user)
+  if (!dev) return res.status(403).json({ error: 'Sem permissão' })
+  await supabase.from('developments').delete().eq('id', dev.id)
   res.json({ ok: true })
 })
 
 // ---- Leads ----
-app.get('/api/admin/leads', auth(), (req, res) => {
-  const where = req.user.role === 'admin' ? '' : 'WHERE l.broker_id = ?'
-  const rows = db.prepare(`SELECT l.*, d.title AS development_title FROM leads l LEFT JOIN developments d ON d.id = l.development_id ${where} ORDER BY l.id DESC`)
-    .all(...(where ? [req.user.id] : []))
-  res.json({ leads: rows })
+app.get('/api/admin/leads', auth(), async (req, res) => {
+  const base = '*, developments(title)'
+  let q = supabase.from('leads').select(base).order('id', { ascending: false })
+  if (req.user.role !== 'admin') q = q.eq('broker_id', req.user.id)
+  const { data } = await q
+  res.json({
+    leads: (data || []).map(({ developments, ...l }) => ({
+      ...l, development_title: developments?.title ?? null, development_id: l.development_id
+    }))
+  })
 })
 
-app.patch('/api/admin/leads/:id/status', auth(), (req, res) => {
-  const lead = db.prepare('SELECT * FROM leads WHERE id = ?').get(req.params.id)
-  if (!lead) return res.status(404).json({ error: 'Lead não encontrado' })
-  if (req.user.role !== 'admin' && lead.broker_id !== req.user.id) return res.status(403).json({ error: 'Sem permissão' })
+app.patch('/api/admin/leads/:id/status', auth(), async (req, res) => {
+  const lead = await findOwned('leads', req.params.id, req.user)
+  if (!lead) return res.status(403).json({ error: 'Lead não encontrado' })
   const statuses = ['novo', 'contatado', 'interessado', 'convertido', 'descartado']
-  const status = statuses.includes(req.body.status) ? req.body.status : lead.status
-  db.prepare('UPDATE leads SET status = ? WHERE id = ?').run(status, lead.id)
+  const status = statuses.includes(req.body?.status) ? req.body.status : lead.status
+  await supabase.from('leads').update({ status }).eq('id', lead.id)
   res.json({ ok: true })
 })
 
 // ---- Perfil do usuário logado ----
-app.patch('/api/profile', auth(), (req, res) => {
-  const { name, whatsapp, instagram, about, photo } = req.body
-  db.prepare('UPDATE users SET name=?, whatsapp=?, instagram=?, about=?, photo=? WHERE id=?')
-    .run(String(name || req.user.name), whatsapp ?? req.user.whatsapp, instagram ?? req.user.instagram, about ?? req.user.about, photo ?? req.user.photo, req.user.id)
+app.patch('/api/profile', auth(), async (req, res) => {
+  const { name, whatsapp, instagram, tiktok, linkedin, facebook, about, photo } = req.body || {}
+  const patch = {}
+  if (name) patch.name = String(name)
+  if (whatsapp !== undefined) patch.whatsapp = whatsapp
+  if (instagram !== undefined) patch.instagram = instagram
+  if (tiktok !== undefined) patch.tiktok = tiktok
+  if (linkedin !== undefined) patch.linkedin = linkedin
+  if (facebook !== undefined) patch.facebook = facebook
+  if (about !== undefined) patch.about = about
+  if (photo !== undefined) patch.photo = photo
+  await supabase.from('users').update(patch).eq('id', req.user.id)
   res.json({ ok: true })
 })
 
-app.use((err, req, res, next) => {
-  console.error(err)
-  res.status(500).json({ error: err.message || 'Erro interno' })
-})
-
 // ---- Posts agendados (geração automática) ----
-const getOwned = (table, id, user) => {
-  const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id)
-  if (!row) return null
-  if (user.role !== 'admin' && row.user_id !== user.id) return null
-  return row
-}
-
-app.get('/api/posts', auth(), (req, res) => {
-  const rows = db.prepare(`SELECT p.*, d.title AS development_title
-    FROM posts p LEFT JOIN developments d ON d.id = p.development_id
-    ${req.user.role === 'admin' ? '' : 'WHERE p.user_id = ?'}
-    ORDER BY p.scheduled_at DESC`).all(...(req.user.role === 'admin' ? [] : [req.user.id]))
-    .map(p => ({ ...p, media: parseMedia(p.media) }))
-  res.json({ posts: rows })
+app.get('/api/posts', auth(), async (req, res) => {
+  let q = supabase.from('posts').select('*, developments(title)').order('scheduled_at', { ascending: false })
+  if (req.user.role !== 'admin') q = q.eq('user_id', req.user.id)
+  const { data } = await q
+  res.json({
+    posts: (data || []).map(({ developments, ...p }) => ({
+      ...p, media: mediaArr(p.media), development_title: developments?.title ?? null
+    }))
+  })
 })
 
-app.post('/api/posts', auth(), (req, res) => {
-  const { development_id, platform, scheduled_at } = req.body
+app.post('/api/posts', auth(), async (req, res) => {
+  const { development_id, platform, scheduled_at } = req.body || {}
   if (!scheduled_at) return res.status(400).json({ error: 'Defina a data/hora do agendamento' })
   const due = new Date(scheduled_at)
   if (isNaN(due)) return res.status(400).json({ error: 'Data inválida' })
 
   let dev = null
   if (development_id) {
-    dev = getOwned('developments', development_id, req.user)
+    dev = await findOwned('developments', development_id, req.user)
     if (!dev) return res.status(403).json({ error: 'Empreendimento não encontrado' })
-    dev.media = parseMedia(dev.media)
   }
-  const generated = generatePosts(dev, req.user)
+  const generated = generatePosts(dev ? { ...dev, media: mediaArr(dev.media) } : null, req.user)
   const targets = platform === 'all' ? PLATFORMS : [platform]
-  if (!targets.every(p => PLATFORMS.includes(p))) return res.status(400).json({ error: 'Plataforma inválida' })
+  if (!targets?.every(p => PLATFORMS.includes(p))) return res.status(400).json({ error: 'Plataforma inválida' })
 
   const iso = due.toISOString()
-  const ids = targets.map(p => {
-    const g = generated[p]
-    const r = db.prepare(`INSERT INTO posts (user_id, development_id, platform, content, media, scheduled_at)
-      VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(req.user.id, development_id || null, p, g.content, JSON.stringify(g.media), iso)
-    return r.lastInsertRowid
-  })
-  res.json({ ok: true, ids, next_publish: iso })
+  const rows = targets.map(p => ({
+    user_id: req.user.id,
+    development_id: development_id || null,
+    platform: p,
+    content: generated[p].content,
+    media: generated[p].media,
+    scheduled_at: iso
+  }))
+  const { data, error } = await supabase.from('posts').insert(rows).select('id')
+  if (error) return res.status(400).json({ error: error.message })
+  res.json({ ok: true, ids: data.map(r => r.id), next_publish: iso })
 })
 
-app.delete('/api/posts/:id', auth(), (req, res) => {
-  const post = getOwned('posts', req.params.id, req.user)
+app.delete('/api/posts/:id', auth(), async (req, res) => {
+  const post = await findOwned('posts', req.params.id, req.user)
   if (!post) return res.status(403).json({ error: 'Post não encontrado' })
-  db.prepare('DELETE FROM posts WHERE id = ?').run(post.id)
+  await supabase.from('posts').delete().eq('id', post.id)
   res.json({ ok: true })
 })
 
-app.patch('/api/posts/:id', auth(), (req, res) => {
-  const post = getOwned('posts', req.params.id, req.user)
+app.patch('/api/posts/:id', auth(), async (req, res) => {
+  const post = await findOwned('posts', req.params.id, req.user)
   if (!post) return res.status(403).json({ error: 'Post não encontrado' })
-  const { scheduled_at } = req.body
+  const { scheduled_at } = req.body || {}
   if (scheduled_at) {
     const due = new Date(scheduled_at)
     if (isNaN(due)) return res.status(400).json({ error: 'Data inválida' })
-    db.prepare('UPDATE posts SET scheduled_at = ? WHERE id = ?').run(due.toISOString(), post.id)
+    await supabase.from('posts').update({ scheduled_at: due.toISOString() }).eq('id', post.id)
   }
   res.json({ ok: true })
 })
 
 // Processador: publica posts vencidos (a cada 60s)
-const checkDuePosts = () => {
+const checkDuePosts = async () => {
   const now = new Date().toISOString()
-  const due = db.prepare("SELECT * FROM posts WHERE status = 'agendado' AND scheduled_at <= ?").all(now)
-  for (const post of due) {
-    publish(post).then(() => {
-      db.prepare("UPDATE posts SET status = 'publicado', published_at = ? WHERE id = ?")
-        .run(new Date().toISOString(), post.id)
-    }).catch(e => console.error('[publish error]', e))
+  const { data: due } = await supabase.from('posts').select('*').eq('status', 'agendado').lte('scheduled_at', now)
+  for (const post of due || []) {
+    try {
+      await publish(post)
+      await supabase.from('posts').update({ status: 'publicado', published_at: new Date().toISOString() }).eq('id', post.id)
+    } catch (e) { console.error('[publish error]', e.message) }
   }
 }
 setInterval(checkDuePosts, 60_000)
 
-app.listen(PORT, () => console.log(`API em http://localhost:${PORT}`))
+app.use((err, req, res, next) => {
+  console.error(err)
+  res.status(500).json({ error: err.message || 'Erro interno' })
+})
+
+app.listen(PORT, () => console.log(`API (Supabase) em http://localhost:${PORT}`))
